@@ -1,0 +1,17 @@
+{
+  // Nome del Worker su Cloudflare
+  "name": "finanze-worker",
+  "main": "worker.js",
+  "compatibility_date": "2025-01-01",
+
+  // Se pubblichi da dashboard (Quick Edit), il binding D1 lo aggiungi da
+  // Settings > Bindings del Worker invece di usare questo file: in quel caso
+  // questo blocco resta solo come promemoria di nomi da usare (binding "DB").
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "finanze-db",
+      "database_id": "INSERISCI-QUI-L-ID-DEL-DATABASE-D1"
+    }
+  ]
+}
