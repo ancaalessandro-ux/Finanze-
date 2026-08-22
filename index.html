@@ -103,6 +103,18 @@ button{font-family:inherit;}
 .leg .pc{color:var(--label-2); font-size:12px;}
 .leg .am{font-weight:700;}
 
+.bank{display:flex; align-items:center; gap:12px;}
+.bank .dot{width:9px; height:9px; border-radius:50%; flex-shrink:0;}
+.bank .dot.on{background:var(--green);}
+.bank .dot.off{background:var(--label-3);}
+.bank .tx{flex:1; min-width:0;}
+.bank .t1{font-size:14.5px; font-weight:600;}
+.bank .t2{font-size:12px; color:var(--label-2); margin-top:2px;}
+.bank button{border:none; border-radius:11px; padding:10px 15px; font-size:13.5px; font-weight:600; cursor:pointer; flex-shrink:0; font-family:inherit;}
+.bank button.primary{background:var(--blue); color:#fff;}
+.bank button.ghost{background:var(--card-2); color:var(--label);}
+.bank select{background:var(--card-2); border:none; border-radius:11px; padding:11px 12px; color:#fff; font-size:14px; font-family:inherit; width:100%; margin-bottom:10px;}
+.banknote{font-size:12px; color:var(--label-2); margin-top:11px; line-height:1.45;}
 .askrow{display:flex; gap:8px;}
 .askin{flex:1; background:var(--card-2); border:none; border-radius:11px; padding:12px 14px;
   color:#fff; font-size:14px; outline:none; font-family:inherit; min-width:0;}
@@ -273,6 +285,13 @@ button{font-family:inherit;}
         <div class="dmid"><div class="a num" id="d-tot">€0</div><div class="b" id="d-cnt">0 spese</div></div>
       </div>
       <ul class="leg" id="leg"></ul>
+    </div>
+  </div>
+
+  <div class="card" id="bank-card">
+    <h3>Conto bancario</h3>
+    <div id="bank-body">
+      <div class="bank"><span class="dot off"></span><div class="tx"><div class="t1">Controllo…</div></div></div>
     </div>
   </div>
 
@@ -760,7 +779,107 @@ async function save(payload){
   }catch(e){ err("Spesa non salvata: "+e.message); }
 }
 
+/* ---------- Collegamento bancario ---------- */
+let bankState = null;
+
+async function bankStatus(){
+  const box = $("#bank-body");
+  if(DEMO){
+    box.innerHTML = `<div class="bank"><span class="dot off"></span><div class="tx">
+      <div class="t1">Non disponibile in modalità dimostrativa</div>
+      <div class="t2">Collega il Worker per usare il conto vero</div></div></div>`;
+    return;
+  }
+  try{
+    bankState = await api("/api/bank/status");
+  }catch{
+    box.innerHTML = `<div class="bank"><span class="dot off"></span><div class="tx">
+      <div class="t1">Stato non disponibile</div></div></div>`;
+    return;
+  }
+
+  if(!bankState.configured){
+    box.innerHTML = `<div class="bank"><span class="dot off"></span><div class="tx">
+      <div class="t1">Non configurato</div>
+      <div class="t2">Mancano le credenziali Enable Banking nel Worker</div></div></div>`;
+    return;
+  }
+
+  if(bankState.connected){
+    const a = bankState.account || {};
+    const sync = bankState.lastSync ? new Date(bankState.lastSync).toLocaleString("it-IT",{day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"}) : "mai";
+    let scad = "";
+    if(a.valid_until){
+      const giorni = Math.ceil((new Date(a.valid_until) - new Date())/864e5);
+      scad = giorni > 0 ? ` · consenso valido ancora ${giorni} giorni` : " · consenso scaduto, ricollega";
+    }
+    box.innerHTML = `<div class="bank">
+      <span class="dot on"></span>
+      <div class="tx"><div class="t1">${a.account_name || "Conto collegato"}</div>
+      <div class="t2">Ultimo aggiornamento: ${sync}${scad}</div></div>
+      <button class="ghost" id="bank-sync">Aggiorna</button></div>
+      <div class="banknote">I movimenti in uscita vengono importati e categorizzati da soli, anche ad app chiusa. Le spese in contanti restano da inserire a mano.</div>`;
+    $("#bank-sync").onclick = bankSync;
+  }else{
+    box.innerHTML = `<div class="bank">
+      <span class="dot off"></span>
+      <div class="tx"><div class="t1">Nessun conto collegato</div>
+      <div class="t2">Collega la banca per importare i movimenti</div></div>
+      <button class="primary" id="bank-connect">Collega</button></div>`;
+    $("#bank-connect").onclick = bankPickBank;
+  }
+}
+
+async function bankPickBank(){
+  const box = $("#bank-body");
+  box.innerHTML = '<div class="bank"><div class="tx"><div class="t1">Carico l\'elenco banche…</div></div></div>';
+  let banks;
+  try{ banks = await api("/api/bank/aspsps"); }
+  catch(e){ box.innerHTML = `<div class="bank"><div class="tx"><div class="t1">Errore</div><div class="t2">${e.message}</div></div></div>`; return; }
+
+  const opts = banks.map(b=>`<option value="${b.name}">${b.name}</option>`).join("");
+  const pref = banks.findIndex(b=>/credit|crédit|agricole|cariparma/i.test(b.name));
+  box.innerHTML = `<select id="bank-sel">${opts}</select>
+    <div class="bank"><div class="tx"><div class="t2">Scegli la tua banca e prosegui sul sito della banca per autorizzare.</div></div>
+    <button class="primary" id="bank-go">Prosegui</button></div>`;
+  if(pref >= 0) $("#bank-sel").selectedIndex = pref;
+
+  $("#bank-go").onclick = async ()=>{
+    const name = $("#bank-sel").value;
+    $("#bank-go").textContent = "Attendi…";
+    try{
+      const d = await api("/api/bank/connect?bank=" + encodeURIComponent(name));
+      window.location.href = d.url;
+    }catch(e){ err("Collegamento non riuscito: "+e.message); bankStatus(); }
+  };
+}
+
+async function bankSync(){
+  const b = $("#bank-sync");
+  if(b){ b.textContent = "…"; b.disabled = true; }
+  try{
+    const r = await api("/api/bank/sync",{method:"POST", body:JSON.stringify({days:30})});
+    await load();
+    if(r.imported === 0) err("Nessun movimento nuovo da importare.");
+  }catch(e){ err("Aggiornamento non riuscito: "+e.message); }
+  bankStatus();
+}
+
+/* Messaggio di ritorno dalla banca */
+(function(){
+  const p = new URLSearchParams(window.location.search);
+  if(p.get("bank") === "ok"){
+    setTimeout(()=>{ err("Conto collegato. Sto importando i movimenti degli ultimi 90 giorni…"); }, 400);
+    history.replaceState({}, "", window.location.pathname);
+    setTimeout(()=>{ load(); bankStatus(); }, 6000);
+  }else if(p.get("bank") === "errore"){
+    setTimeout(()=>{ err("Collegamento alla banca non riuscito. Riprova."); }, 400);
+    history.replaceState({}, "", window.location.pathname);
+  }
+})();
+
 load();
+bankStatus();
 </script>
 </body>
 </html>
