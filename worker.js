@@ -25,6 +25,7 @@
 //   GET    /api/bank/connect?bank=..  -> avvia il collegamento, restituisce l'URL della banca
 //   GET    /api/bank/callback         -> ritorno dalla banca (registrato su Enable Banking)
 //   POST   /api/bank/sync             -> scarica i movimenti e li importa
+//   GET    /api/bank/recategorize     -> ripulisce nomi e ricategorizza i movimenti già importati
 //   DELETE /api/bank/session          -> scollega il conto
 
 const CORS_HEADERS = {
@@ -251,26 +252,77 @@ async function setSetting(env, key, value) {
   await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(key, String(value)).run();
 }
 
+/* Ripulisce la descrizione grezza della banca lasciando solo il nome del negozio */
+function cleanMerchant(raw) {
+  if (!raw) return null;
+  let s = String(raw).replace(/\s+/g, " ").trim();
+
+  const co = s.match(/C\/O\s+(.+)$/i);
+  if (co) {
+    s = co[1];
+  } else {
+    s = s
+      .replace(/\bPOS\s+CARTA\b/ig, "")
+      .replace(/\bCA\s+DEBIT\s+VISA\b/ig, "")
+      .replace(/\bCARTA\b\s*N\.?\s*\*+\s*\d+/ig, "")
+      .replace(/N\.\s*\*+\d+/g, "")
+      .replace(/\bDEL\s+\d{1,2}\/\d{1,2}\/\d{2,4}\b/ig, "")
+      .replace(/\bORE\s+\d{1,2}[:.]\d{2}\b/ig, "")
+      .replace(/\bPERIODO\s+DAL\b.*$/i, "")
+      .replace(/\bDATA\s+CONTABILE\b.*$/i, "");
+  }
+
+  s = s.replace(/\s{2,}/g, " ").replace(/^[\s\-–:]+|[\s\-–:]+$/g, "").trim();
+  if (!s) return null;
+
+  if (s === s.toUpperCase()) {
+    s = s.toLowerCase().replace(/(^|[\s'\-\/])(\p{L})/gu, (m, a, b) => a + b.toUpperCase());
+  }
+  return s.slice(0, 80);
+}
+
 /* Categorizza in blocco i movimenti bancari tramite l'IA */
 async function categorizeBank(env, items) {
   const { results: cats } = await env.DB.prepare("SELECT name FROM categories").all();
   const catList = cats.map((c) => c.name).join(", ");
-  const list = items.map((it, i) => `${i}: ${it.merchant || "senza nome"} — €${it.amount.toFixed(2)}`).join("\n");
+  const out = {};
+  const CHUNK = 20;
 
-  const prompt = `Assegna una categoria di spesa a ciascun movimento bancario italiano elencato qui sotto.
-Categorie disponibili: ${catList}.
-Se nessuna si adatta bene, usa una categoria nuova con un nome breve e generico (es. "Casa", "Salute", "Tasse").
-Rispondi SOLO con un oggetto JSON, senza testo attorno, nella forma {"0":"NomeCategoria","1":"NomeCategoria",...} usando gli stessi indici numerici della lista.
+  for (let start = 0; start < items.length; start += CHUNK) {
+    const slice = items.slice(start, start + CHUNK);
+    const list = slice
+      .map((it, i) => `${start + i}: ${it.merchant || "senza nome"} — €${it.amount.toFixed(2)}`)
+      .join("\n");
+
+    const prompt = `Assegna una categoria di spesa a ciascun movimento bancario italiano elencato qui sotto.
+Categorie già esistenti: ${catList}.
+Preferisci sempre una categoria esistente. Se davvero nessuna si adatta, usane una nuova con nome breve e generico.
+
+Criteri:
+- supermercati, alimentari, discount (Conad, Coop, Lidl, Esselunga, Despar…) -> "Spesa"
+- distributori e stazioni di servizio (Q8, Eni, IP, Tamoil, Robgas…) -> "Carburante"
+- bar, ristoranti, pizzerie, fast food (McDonald's, trattorie, pub…) -> "Bar e ristoranti"
+- pedaggi, parcheggi, treni, autobus, taxi -> "Trasporti"
+- canoni, commissioni, imposte di bollo, spese bancarie -> "Banca"
+- bollette, luce, gas, acqua, telefonia, affitto -> "Casa"
+- farmacie, visite, analisi -> "Salute"
+- negozi di abbigliamento, elettronica, e-commerce -> "Shopping"
+- cinema, palestra, abbonamenti streaming -> "Svago"
+
+Rispondi SOLO con un oggetto JSON, senza testo attorno, nella forma {"0":"NomeCategoria","1":"NomeCategoria"} usando esattamente gli indici numerici mostrati.
 
 Movimenti:
 ${list}`;
 
-  try {
-    const raw = await callClaude(env, [{ role: "user", content: prompt }], { maxTokens: 1000 });
-    return JSON.parse(raw);
-  } catch {
-    return {};
+    try {
+      const raw = await callClaude(env, [{ role: "user", content: prompt }], { maxTokens: 1500 });
+      const parsed = JSON.parse(raw);
+      Object.assign(out, parsed);
+    } catch {
+      /* blocco fallito: quei movimenti restano senza categoria assegnata */
+    }
   }
+  return out;
 }
 
 /* Scarica i movimenti e li salva come spese, saltando quelli già presenti */
@@ -303,17 +355,18 @@ async function syncBank(env, { days = 30 } = {}) {
     const date = (t.booking_date || t.value_date || t.transaction_date || "").slice(0, 10)
       || new Date().toISOString().slice(0, 10);
 
-    const merchant = t.creditor?.name
-      || (Array.isArray(t.remittance_information) ? t.remittance_information[0] : t.remittance_information)
+    const rawMerchant = t.creditor?.name
+      || (Array.isArray(t.remittance_information) ? t.remittance_information.join(" ") : t.remittance_information)
       || t.merchant_category_code || null;
+    const merchant = cleanMerchant(rawMerchant);
 
     const ref = t.entry_reference || t.transaction_id
-      || `${date}|${amount.toFixed(2)}|${(merchant || "").slice(0, 40)}`;
+      || `${date}|${amount.toFixed(2)}|${String(rawMerchant || "").slice(0, 40)}`;
 
     const exists = await env.DB.prepare("SELECT id FROM expenses WHERE bank_ref = ?").bind(ref).first();
     if (exists) continue;
 
-    candidates.push({ amount, date, merchant: merchant ? String(merchant).slice(0, 80) : null, ref });
+    candidates.push({ amount, date, merchant, ref });
   }
 
   if (candidates.length === 0) {
@@ -326,7 +379,7 @@ async function syncBank(env, { days = 30 } = {}) {
   let imported = 0;
   for (let i = 0; i < candidates.length; i++) {
     const c = candidates[i];
-    const catName = mapping[String(i)] || "Oggetti";
+    const catName = mapping[String(i)] || "Altro";
     const cat = await getOrCreateCategory(env, catName);
     try {
       await env.DB.prepare(
@@ -606,6 +659,37 @@ Rispondi SOLO con un oggetto JSON, senza testo attorno:
         } catch (e) {
           return Response.redirect(`${APP_URL}?bank=errore`, 302);
         }
+      }
+
+      if (pathname === "/api/bank/recategorize" && (method === "POST" || method === "GET")) {
+        const { results } = await env.DB
+          .prepare("SELECT id, amount, merchant, note FROM expenses WHERE source = 'banca'").all();
+        if (results.length === 0) return json({ updated: 0, message: "Nessun movimento bancario da sistemare" });
+
+        const items = results.map((r) => ({
+          amount: r.amount,
+          merchant: cleanMerchant(r.merchant || r.note),
+        }));
+
+        const mapping = await categorizeBank(env, items);
+
+        let updated = 0, renamed = 0;
+        for (let i = 0; i < results.length; i++) {
+          const row = results[i];
+          const newName = items[i].merchant;
+          const catName = mapping[String(i)];
+
+          if (newName && newName !== row.merchant) {
+            await env.DB.prepare("UPDATE expenses SET merchant = ? WHERE id = ?").bind(newName, row.id).run();
+            renamed++;
+          }
+          if (catName) {
+            const cat = await getOrCreateCategory(env, catName);
+            await env.DB.prepare("UPDATE expenses SET category_id = ? WHERE id = ?").bind(cat.id, row.id).run();
+            updated++;
+          }
+        }
+        return json({ total: results.length, updated, renamed });
       }
 
       if (pathname === "/api/bank/sync" && method === "POST") {
