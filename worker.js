@@ -3,6 +3,9 @@
 // Binding richiesti (dashboard Cloudflare, Settings > Bindings del Worker):
 //   - D1 database:      variabile "DB"
 //   - Secret:           ANTHROPIC_API_KEY
+//   - Secret:           EB_APP_ID        (collegamento bancario)
+//   - Secret:           EB_PRIVATE_KEY   (collegamento bancario)
+//   - Cron Trigger:     es. "0 */6 * * *" per la sincronizzazione automatica
 //
 // Rotte:
 //   GET    /api/categories
@@ -17,6 +20,12 @@
 //   POST   /api/ask                   { question } -> risposta dell'IA sulle tue spese
 //   POST   /api/receipt               { image_base64, media_type } -> legge lo scontrino, NON salva
 //   POST   /api/voice                 { text }                     -> interpreta e salva subito
+//   GET    /api/bank/status           -> stato del collegamento bancario
+//   GET    /api/bank/aspsps           -> elenco banche italiane disponibili
+//   GET    /api/bank/connect?bank=..  -> avvia il collegamento, restituisce l'URL della banca
+//   GET    /api/bank/callback         -> ritorno dalla banca (registrato su Enable Banking)
+//   POST   /api/bank/sync             -> scarica i movimenti e li importa
+//   DELETE /api/bank/session          -> scollega il conto
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -155,8 +164,186 @@ async function computeStats(env, month) {
   };
 }
 
+/* ============================================================
+   COLLEGAMENTO BANCARIO (Enable Banking)
+   Secret richiesti:
+     - EB_APP_ID          : ID dell'applicazione (nome del file .pem senza estensione)
+     - EB_PRIVATE_KEY     : contenuto del file .pem
+   Costante da controllare: APP_URL (indirizzo del sito su Pages)
+   ============================================================ */
+
+const EB_API = "https://api.enablebanking.com";
+const APP_URL = "https://finanze-40i.pages.dev";
+
+function b64urlFromBytes(bytes) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64urlFromString(str) {
+  return b64urlFromBytes(new TextEncoder().encode(str));
+}
+
+function pemToPkcs8(pem) {
+  if (/BEGIN RSA PRIVATE KEY/.test(pem)) {
+    throw new Error("La chiave è in formato PKCS#1. Serve una chiave PKCS#8 (che inizia con BEGIN PRIVATE KEY).");
+  }
+  const body = pem
+    .replace(/-----BEGIN [^-]+-----/g, "")
+    .replace(/-----END [^-]+-----/g, "")
+    .replace(/\s+/g, "");
+  const bin = atob(body);
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return buf.buffer;
+}
+
+let cachedJwt = null;
+async function ebJwt(env) {
+  const now = Math.floor(Date.now() / 1000);
+  if (cachedJwt && cachedJwt.exp > now + 60) return cachedJwt.token;
+
+  if (!env.EB_APP_ID || !env.EB_PRIVATE_KEY) {
+    throw new Error("Collegamento bancario non configurato: mancano EB_APP_ID o EB_PRIVATE_KEY.");
+  }
+
+  const exp = now + 3600;
+  const header = b64urlFromString(JSON.stringify({ typ: "JWT", alg: "RS256", kid: env.EB_APP_ID }));
+  const body = b64urlFromString(JSON.stringify({
+    iss: "enablebanking.com",
+    aud: "api.enablebanking.com",
+    iat: now,
+    exp,
+  }));
+  const signingInput = `${header}.${body}`;
+
+  const key = await crypto.subtle.importKey(
+    "pkcs8", pemToPkcs8(env.EB_PRIVATE_KEY),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]
+  );
+  const sigBuf = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, new TextEncoder().encode(signingInput));
+  const token = `${signingInput}.${b64urlFromBytes(new Uint8Array(sigBuf))}`;
+
+  cachedJwt = { token, exp };
+  return token;
+}
+
+async function ebFetch(env, path, options = {}) {
+  const token = await ebJwt(env);
+  const resp = await fetch(EB_API + path, {
+    ...options,
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+  const text = await resp.text();
+  if (!resp.ok) throw new Error(`Enable Banking ${resp.status}: ${text.slice(0, 300)}`);
+  try { return JSON.parse(text); } catch { return {}; }
+}
+
+async function getSetting(env, key) {
+  const r = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first();
+  return r ? r.value : null;
+}
+async function setSetting(env, key, value) {
+  await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(key, String(value)).run();
+}
+
+/* Categorizza in blocco i movimenti bancari tramite l'IA */
+async function categorizeBank(env, items) {
+  const { results: cats } = await env.DB.prepare("SELECT name FROM categories").all();
+  const catList = cats.map((c) => c.name).join(", ");
+  const list = items.map((it, i) => `${i}: ${it.merchant || "senza nome"} — €${it.amount.toFixed(2)}`).join("\n");
+
+  const prompt = `Assegna una categoria di spesa a ciascun movimento bancario italiano elencato qui sotto.
+Categorie disponibili: ${catList}.
+Se nessuna si adatta bene, usa una categoria nuova con un nome breve e generico (es. "Casa", "Salute", "Tasse").
+Rispondi SOLO con un oggetto JSON, senza testo attorno, nella forma {"0":"NomeCategoria","1":"NomeCategoria",...} usando gli stessi indici numerici della lista.
+
+Movimenti:
+${list}`;
+
+  try {
+    const raw = await callClaude(env, [{ role: "user", content: prompt }], { maxTokens: 1000 });
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+/* Scarica i movimenti e li salva come spese, saltando quelli già presenti */
+async function syncBank(env, { days = 30 } = {}) {
+  const sess = await env.DB
+    .prepare("SELECT session_id, account_uid FROM bank_sessions ORDER BY id DESC LIMIT 1").first();
+  if (!sess) return { imported: 0, skipped: 0, error: "Nessun conto collegato" };
+
+  const from = new Date(Date.now() - days * 864e5).toISOString().slice(0, 10);
+  const collected = [];
+  let cont = null, pages = 0;
+
+  do {
+    const q = new URLSearchParams({ date_from: from });
+    if (cont) q.set("continuation_key", cont);
+    const data = await ebFetch(env, `/accounts/${sess.account_uid}/transactions?${q}`);
+    (data.transactions || []).forEach((t) => collected.push(t));
+    cont = data.continuation_key || null;
+    pages++;
+  } while (cont && pages < 5);
+
+  const candidates = [];
+  for (const t of collected) {
+    const indicator = (t.credit_debit_indicator || "").toUpperCase();
+    if (indicator !== "DBIT") continue;
+
+    const amount = Math.abs(parseFloat(t.transaction_amount?.amount ?? t.amount ?? 0));
+    if (!amount) continue;
+
+    const date = (t.booking_date || t.value_date || t.transaction_date || "").slice(0, 10)
+      || new Date().toISOString().slice(0, 10);
+
+    const merchant = t.creditor?.name
+      || (Array.isArray(t.remittance_information) ? t.remittance_information[0] : t.remittance_information)
+      || t.merchant_category_code || null;
+
+    const ref = t.entry_reference || t.transaction_id
+      || `${date}|${amount.toFixed(2)}|${(merchant || "").slice(0, 40)}`;
+
+    const exists = await env.DB.prepare("SELECT id FROM expenses WHERE bank_ref = ?").bind(ref).first();
+    if (exists) continue;
+
+    candidates.push({ amount, date, merchant: merchant ? String(merchant).slice(0, 80) : null, ref });
+  }
+
+  if (candidates.length === 0) {
+    await setSetting(env, "last_sync", new Date().toISOString());
+    return { imported: 0, skipped: collected.length };
+  }
+
+  const mapping = await categorizeBank(env, candidates);
+
+  let imported = 0;
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
+    const catName = mapping[String(i)] || "Oggetti";
+    const cat = await getOrCreateCategory(env, catName);
+    try {
+      await env.DB.prepare(
+        `INSERT OR IGNORE INTO expenses (amount, category_id, payment_method, merchant, expense_date, source, bank_ref)
+         VALUES (?, ?, 'carta', ?, ?, 'banca', ?)`
+      ).bind(c.amount, cat.id, c.merchant, c.date, c.ref).run();
+      imported++;
+    } catch { /* duplicato o errore singolo: si prosegue */ }
+  }
+
+  await setSetting(env, "last_sync", new Date().toISOString());
+  return { imported, skipped: collected.length - imported };
+}
+
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname } = url;
     const method = request.method;
@@ -357,9 +544,88 @@ Rispondi SOLO con un oggetto JSON, senza testo attorno:
         return json({ id: inserted.id, amount: parsed.amount, category: cat.name }, 201);
       }
 
+
+      // ---------- COLLEGAMENTO BANCARIO ----------
+      if (pathname === "/api/bank/status" && method === "GET") {
+        const sess = await env.DB
+          .prepare("SELECT account_name, iban, valid_until, created_at FROM bank_sessions ORDER BY id DESC LIMIT 1").first();
+        const lastSync = await getSetting(env, "last_sync");
+        const configured = Boolean(env.EB_APP_ID && env.EB_PRIVATE_KEY);
+        return json({ configured, connected: Boolean(sess), account: sess || null, lastSync });
+      }
+
+      if (pathname === "/api/bank/aspsps" && method === "GET") {
+        const data = await ebFetch(env, "/aspsps?country=IT");
+        const banks = (data.aspsps || []).map((a) => ({ name: a.name, country: a.country, logo: a.logo }));
+        return json(banks);
+      }
+
+      if (pathname === "/api/bank/connect" && method === "GET") {
+        const bank = url.searchParams.get("bank");
+        if (!bank) return json({ error: "Banca non specificata" }, 400);
+        const validUntil = new Date(Date.now() + 89 * 864e5).toISOString();
+        const data = await ebFetch(env, "/auth", {
+          method: "POST",
+          body: JSON.stringify({
+            access: { valid_until: validUntil },
+            aspsp: { name: bank, country: "IT" },
+            state: crypto.randomUUID(),
+            redirect_url: `${new URL(request.url).origin}/api/bank/callback`,
+            psu_type: "personal",
+          }),
+        });
+        return json({ url: data.url });
+      }
+
+      if (pathname === "/api/bank/callback" && method === "GET") {
+        const code = url.searchParams.get("code");
+        if (!code) {
+          return Response.redirect(`${APP_URL}?bank=errore`, 302);
+        }
+        try {
+          const session = await ebFetch(env, "/sessions", {
+            method: "POST",
+            body: JSON.stringify({ code }),
+          });
+          const acc = (session.accounts || [])[0];
+          if (!acc) throw new Error("Nessun conto restituito dalla banca");
+          const uid = acc.uid || acc.account_id?.iban || acc;
+          await env.DB.prepare("DELETE FROM bank_sessions").run();
+          await env.DB.prepare(
+            "INSERT INTO bank_sessions (session_id, account_uid, account_name, iban, valid_until) VALUES (?, ?, ?, ?, ?)"
+          ).bind(
+            session.session_id || "",
+            String(uid),
+            acc.name || acc.product || "Conto",
+            acc.account_id?.iban || null,
+            session.access?.valid_until || null
+          ).run();
+
+          ctx.waitUntil(syncBank(env, { days: 90 }).catch(() => {}));
+          return Response.redirect(`${APP_URL}?bank=ok`, 302);
+        } catch (e) {
+          return Response.redirect(`${APP_URL}?bank=errore`, 302);
+        }
+      }
+
+      if (pathname === "/api/bank/sync" && method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        return json(await syncBank(env, { days: body.days || 30 }));
+      }
+
+      if (pathname === "/api/bank/session" && method === "DELETE") {
+        await env.DB.prepare("DELETE FROM bank_sessions").run();
+        return json({ ok: true });
+      }
+
       return json({ error: "Rotta non trovata" }, 404);
     } catch (err) {
       return json({ error: err.message || "Errore interno" }, 500);
     }
+  },
+
+  // Sincronizzazione automatica periodica (Cron Trigger)
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(syncBank(env, { days: 14 }).catch(() => {}));
   },
 };
